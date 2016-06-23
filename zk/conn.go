@@ -21,6 +21,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/golang/glog"
 )
 
 // ErrNoServer indicates that an operation cannot be completed
@@ -288,16 +290,17 @@ func (c *Conn) connect() error {
 		if err == nil {
 			c.conn = zkConn
 			c.setState(StateConnected)
-			c.logger.Printf("Connected to %s", c.Server())
+			glog.Infof("Connected to %s", c.Server())
 			return nil
 		}
 
-		c.logger.Printf("Failed to connect to %s: %+v", c.Server(), err)
+		glog.Warningf("Failed to connect to %s: %+v", c.Server(), err)
 	}
 }
 
 func (c *Conn) loop() {
 	for {
+		glog.Infoln("trying to connect to zookeeper...")
 		if err := c.connect(); err != nil {
 			// c.Close() was called
 			return
@@ -306,13 +309,13 @@ func (c *Conn) loop() {
 		err := c.authenticate()
 		switch {
 		case err == ErrSessionExpired:
-			c.logger.Printf("Authentication failed: %s", err)
+			glog.Errorf("Authentication failed: %s", err)
 			c.invalidateWatches(err)
 		case err != nil && c.conn != nil:
-			c.logger.Printf("Authentication failed: %s", err)
+			glog.Errorf("Authentication failed: %s", err)
 			c.conn.Close()
 		case err == nil:
-			c.logger.Printf("Authenticated: id=%d, timeout=%d", c.SessionID(), c.sessionTimeoutMs)
+			glog.Infof("Authenticated: id=%d, timeout=%d", c.SessionID(), c.sessionTimeoutMs)
 			c.hostProvider.Connected()       // mark success
 			closeChan := make(chan struct{}) // channel to tell send loop stop
 			var wg sync.WaitGroup
@@ -320,7 +323,7 @@ func (c *Conn) loop() {
 			wg.Add(1)
 			go func() {
 				err := c.sendLoop(c.conn, closeChan)
-				c.logger.Printf("Send loop terminated: err=%v", err)
+				glog.Warningf("Send loop terminated: err=%v", err)
 				c.conn.Close() // causes recv loop to EOF/exit
 				wg.Done()
 			}()
@@ -328,7 +331,7 @@ func (c *Conn) loop() {
 			wg.Add(1)
 			go func() {
 				err := c.recvLoop(c.conn)
-				c.logger.Printf("Recv loop terminated: err=%v", err)
+				glog.Warningf("Recv loop terminated: err=%v", err)
 				if err == nil {
 					panic("zk: recvLoop should never return nil error")
 				}
@@ -439,7 +442,7 @@ func (c *Conn) sendSetWatches() {
 		res := &setWatchesResponse{}
 		_, err := c.request(opSetWatches, req, res, nil)
 		if err != nil {
-			c.logger.Printf("Failed to set previous watches: %s", err.Error())
+			glog.Errorf("Failed to set previous watches: %s", err.Error())
 		}
 	}()
 }
@@ -473,6 +476,10 @@ func (c *Conn) authenticate() error {
 	_, err = io.ReadFull(c.conn, buf[:4])
 	c.conn.SetReadDeadline(time.Time{})
 	if err != nil {
+		// sometimes, zookeeper reconfigured, but it only send the EOF to me
+		atomic.StoreInt64(&c.sessionID, int64(0))
+		c.lastZxid = 0
+		c.setState(StateExpired)
 		return err
 	}
 
@@ -639,7 +646,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 		} else if res.Xid == -2 {
 			// Ping response. Ignore.
 		} else if res.Xid < 0 {
-			c.logger.Printf("Xid < 0 (%d) but not ping or watcher event", res.Xid)
+			glog.Warningf("Xid < 0 (%d) but not ping or watcher event", res.Xid)
 		} else {
 			if res.Zxid > 0 {
 				c.lastZxid = res.Zxid
@@ -653,7 +660,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 			c.requestsLock.Unlock()
 
 			if !ok {
-				c.logger.Printf("Response for unknown request with xid %d", res.Xid)
+				glog.Warningf("Response for unknown request with xid %d", res.Xid)
 			} else {
 				if res.Err != 0 {
 					err = res.Err.toError()
